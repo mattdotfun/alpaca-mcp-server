@@ -131,6 +131,8 @@ except ImportError:
     )
 
 from mcp.server.fastmcp import FastMCP
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 # Configure Python path for local imports (UserAgentMixin)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -160,6 +162,7 @@ except ImportError:
 load_dotenv()
 
 # Get environment variables
+MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")  # Optional bearer token for HTTP auth
 TRADE_API_KEY = os.getenv("ALPACA_API_KEY")
 TRADE_API_SECRET = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_PAPER_TRADE = os.getenv("ALPACA_PAPER_TRADE", "True")
@@ -178,6 +181,30 @@ def detect_pycharm_environment():
 is_pycharm = detect_pycharm_environment()
 log_level = "ERROR" if is_pycharm else "INFO"
 log_level = "DEBUG" if DEBUG.lower() == "true" else log_level
+
+# Bearer token authentication middleware for HTTP transport
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Middleware that requires a valid Bearer token for all requests."""
+
+    async def dispatch(self, request, call_next):
+        # Skip auth for health checks
+        if request.url.path == "/health":
+            return await call_next(request)
+
+        expected_token = os.getenv("MCP_AUTH_TOKEN")
+        if not expected_token:
+            # No token configured, allow all requests
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return Response("Unauthorized: Missing Bearer token", status_code=401)
+
+        provided_token = auth_header[7:]  # Strip "Bearer " prefix
+        if provided_token != expected_token:
+            return Response("Unauthorized: Invalid token", status_code=401)
+
+        return await call_next(request)
 
 # Initialize FastMCP server
 mcp = FastMCP("alpaca-trading", log_level=log_level)
@@ -3213,9 +3240,27 @@ class AlpacaMCPServer:
                 
             else:
                 print("DNS protection: localhost only", file=sys.stderr)
-            
-            # Start the server with streamable HTTP transport
-            mcp.run(transport="streamable-http")
+
+            # Get the Starlette app and add bearer auth middleware if configured
+            import uvicorn
+            starlette_app = mcp.streamable_http_app()
+
+            if MCP_AUTH_TOKEN:
+                starlette_app.add_middleware(BearerAuthMiddleware)
+                print("Bearer token auth enabled", file=sys.stderr)
+            else:
+                print("WARNING: No MCP_AUTH_TOKEN set - endpoint is unprotected!", file=sys.stderr)
+
+            # Start the server with uvicorn
+            config = uvicorn.Config(
+                starlette_app,
+                host=host,
+                port=port,
+                log_level="warning",
+            )
+            server = uvicorn.Server(config)
+            import asyncio
+            asyncio.run(server.serve())
             
         else:
             # Use stdio transport (default)
